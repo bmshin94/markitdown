@@ -27,7 +27,8 @@
 8. [자주 만나는 에러](#8-자주-만나는-에러)
 9. [수익화 검토](#9-수익화-검토)
 10. [PHP 연동 방법](#10-php-연동-방법)
-11. [보안 체크리스트](#11-보안-체크리스트)
+11. [React / 프론트엔드 연동 방법](#11-react--프론트엔드-연동-방법)
+12. [보안 체크리스트](#12-보안-체크리스트)
 
 ---
 
@@ -859,9 +860,293 @@ services:
 
 ---
 
-## 11. 보안 체크리스트
+## 11. React / 프론트엔드 연동 방법
 
-### 11-1. 셸 인젝션 (최우선)
+### 11-1. 결론
+
+| 질문 | 답 |
+|---|---|
+| MarkItDown을 JS로 재구현 | 🟡 **일부는 가능** (PHP보다는 나음) |
+| React로 이걸 활용한 서비스 구축 | ✅ 가능. 오히려 UI 측면에서 최적 |
+
+> ⚠️ 전제: React는 **브라우저에서 도는 UI 라이브러리**입니다. 파이썬을 실행할 수 없습니다.
+> 따라서 "React가 MarkItDown을 직접 실행"하는 것은 불가능하고, **React(화면) + 백엔드(변환)** 구조가 됩니다.
+
+### 11-2. JS 생태계 대안 (PHP와 다른 점)
+
+PHP와 달리 JS 진영은 문서 처리 라이브러리가 상당히 갖춰져 있습니다.
+
+| MarkItDown 의존성 | JS 대안 | 평가 |
+|---|---|---|
+| `mammoth` (Word) | **`mammoth.js`** | ✅ 원본이 JS. 파이썬판이 포팅본 |
+| `pdfminer` / `pdfplumber` | `pdf.js` | 🟡 텍스트는 되나 표 추출이 약함 |
+| `pandas` / `openpyxl` (Excel) | **`SheetJS (xlsx)`** | ✅ 우수 |
+| `markdownify` (HTML→MD) | **`turndown`** | ✅ 우수 |
+| ZIP 처리 | **`JSZip`** | ✅ 양호 |
+| `python-pptx` (PPT) | 파싱용 라이브러리 빈약 | ⚠️ XML 직접 처리 필요 |
+| **`magika`** (AI 파일 탐지) | 없음 | ❌ |
+| `SpeechRecognition` (음성) | 브라우저 단독 불가 | ❌ |
+| `youtube-transcript-api` | CORS로 차단됨 | ❌ |
+| `olefile` (.msg) | 없음 | ❌ |
+
+### 11-3. 방법 A — 순수 브라우저 변환 (서버 없음)
+
+Word / Excel / HTML 정도는 **서버 없이 브라우저에서** 변환 가능합니다.
+
+```jsx
+import mammoth from "mammoth";
+import TurndownService from "turndown";
+import * as XLSX from "xlsx";
+
+const turndown = new TurndownService();
+
+async function convertInBrowser(file) {
+  const buffer = await file.arrayBuffer();
+  const ext = file.name.split(".").pop().toLowerCase();
+
+  if (ext === "docx") {
+    const { value: html } = await mammoth.convertToHtml({ arrayBuffer: buffer });
+    return turndown.turndown(html);
+  }
+
+  if (ext === "xlsx" || ext === "csv") {
+    const wb = XLSX.read(buffer);
+    return wb.SheetNames
+      .map((name) => `## ${name}\n\n` + XLSX.utils.sheet_to_csv(wb.Sheets[name]))
+      .join("\n\n");
+  }
+
+  throw new Error(`${ext}는 서버 변환이 필요합니다`);
+}
+```
+
+| 장점 | 단점 |
+|---|---|
+| 서버 비용 0원 | PDF 품질이 MarkItDown보다 낮음 |
+| 파일이 서버로 가지 않음 (개인정보 이슈 없음) | PPT / 음성 / YouTube / OCR 불가 |
+| 업로드 대기 없이 빠름 | 대용량 파일 시 브라우저가 멈춤 |
+
+> 💡 **활용 전략:** 이 방식을 **무료 체험판**으로 두고, 어려운 포맷은 서버 변환(유료)으로 유도하는 퍼널을 만들 수 있습니다.
+
+### 11-4. 방법 B — Next.js + Python 서비스 (권장)
+
+```
+React (Next.js) ──→ Next API Route ──→ Python FastAPI (MarkItDown)
+```
+
+**Python 쪽** (10-5의 코드에 CORS만 추가)
+
+```python
+# converter_api.py
+from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from markitdown import MarkItDown
+import io
+
+app = FastAPI()
+md = MarkItDown()
+
+# 개발용 설정. 배포 시에는 실제 도메인만 허용할 것
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["POST"],
+)
+
+@app.post("/convert")
+async def convert(file: UploadFile):
+    try:
+        data = await file.read()
+        result = md.convert_stream(
+            io.BytesIO(data),
+            file_extension="." + file.filename.rsplit(".", 1)[-1],
+        )
+        return {"ok": True, "markdown": result.markdown, "title": result.title}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+```
+
+**Next.js API Route (프록시)**
+
+```ts
+// app/api/convert/route.ts
+export async function POST(req: Request) {
+  const formData = await req.formData();
+  const file = formData.get("file") as File;
+
+  if (!file) {
+    return Response.json({ error: "파일이 없습니다" }, { status: 400 });
+  }
+  if (file.size > 50 * 1024 * 1024) {
+    return Response.json({ error: "50MB까지만 가능합니다" }, { status: 413 });
+  }
+
+  // Python 서버는 내부망에만 두고, 브라우저는 이 프록시만 호출하게 함
+  const upstream = new FormData();
+  upstream.append("file", file);
+
+  const res = await fetch(`${process.env.CONVERTER_URL}/convert`, {
+    method: "POST",
+    body: upstream,
+  });
+
+  return Response.json(await res.json(), { status: res.status });
+}
+```
+
+**React 컴포넌트**
+
+```jsx
+"use client";
+import { useState } from "react";
+
+export default function Converter() {
+  const [markdown, setMarkdown] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setLoading(true);
+    setError("");
+    setMarkdown("");
+
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+
+      const res = await fetch("/api/convert", { method: "POST", body: fd });
+      const data = await res.json();
+
+      if (!res.ok) throw new Error(data.error ?? data.detail ?? "변환 실패");
+      setMarkdown(data.markdown);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="p-6">
+      <input type="file" onChange={handleFile} disabled={loading} />
+
+      {loading && <p>변환 중...</p>}
+      {error && <p className="text-red-500">{error}</p>}
+
+      {markdown && (
+        <>
+          <button onClick={() => navigator.clipboard.writeText(markdown)}>
+            복사하기
+          </button>
+          <pre className="mt-4 whitespace-pre-wrap bg-gray-50 p-4 rounded">
+            {markdown}
+          </pre>
+        </>
+      )}
+    </div>
+  );
+}
+```
+
+> 🛡️ **API Route를 반드시 거쳐야 하는 이유:** 브라우저가 Python 서버를 직접 호출하면 누구나 그 주소로 임의의 파일을 보낼 수 있습니다.
+> 프록시를 두면 용량 제한·인증·크레딧 차감을 이 지점에서 강제할 수 있습니다.
+
+### 11-5. 방법 C — Electron / Tauri 데스크톱 앱
+
+```
+Electron 앱 = React UI + Python(MarkItDown) 번들
+```
+
+| 장점 | 단점 |
+|---|---|
+| 서버 비용 0원 (사용자 PC에서 실행) | 앱 용량 증가 (파이썬 런타임 포함 시 200MB+) |
+| 파일이 외부로 나가지 않음 | 자동 업데이트를 직접 구현해야 함 |
+| 구독이 아닌 **매절 판매** 모델 가능 | 플랫폼별 빌드 필요 |
+| 업로드 대기 없이 빠름 | |
+
+> 💡 9-3의 세무/법무 SaaS 아이디어에서 **"고객 자료를 외부 서버에 올릴 수 없다"**는 요구가 자주 나옵니다.
+> 그런 고객에게는 데스크톱 앱이 사실상 유일한 답입니다.
+
+### 11-6. 방법 D — Pyodide (비권장)
+
+브라우저에서 WASM으로 파이썬을 실행하는 방식이지만, 실용성이 낮습니다.
+
+- `magika`가 ONNX 런타임을 요구 → Pyodide에서 사실상 불가
+- `pdfminer`, `pandas` 등 무거운 패키지 다운로드로 수십 MB
+- 초기 로딩 10초 이상
+
+👉 같은 목적이라면 **11-3의 순수 JS 방식**이 훨씬 현실적입니다.
+
+### 11-7. 방법 비교
+
+| 방식 | 서버비 | 변환 품질 | 난이도 | 적합한 상황 |
+|---|---|---|---|---|
+| 순수 JS (브라우저) | 0원 | 🟡 제한적 | ⭐⭐ | 무료 체험판 |
+| **React + Python API** | 있음 | ✅ 완전 | ⭐⭐⭐ | ⭐ 상용 SaaS |
+| **Electron 데스크톱** | 0원 | ✅ 완전 | ⭐⭐⭐⭐ | 보안 민감 고객, 매절 판매 |
+| Pyodide | 0원 | ❌ | ⭐⭐⭐⭐⭐ | 비권장 |
+
+### 11-8. PHP vs React — 무엇을 쓸 것인가
+
+둘은 경쟁 관계가 아니라 **계층이 다릅니다.**
+
+```
+프론트엔드(화면)  →  React  또는  PHP 템플릿
+백엔드(로직)      →  PHP    또는  Next.js / FastAPI
+변환 엔진         →  Python (고정)
+```
+
+| 상황 | 추천 조합 |
+|---|---|
+| PHP에 익숙함 | PHP + Python (10장 참고) |
+| JS/React에 익숙함 | **Next.js + Python** |
+| UI 완성도가 중요함 | React 프론트 + PHP API + Python |
+| 서버비 절감 + 매절 판매 | Electron + React + Python |
+
+> React를 선택하는 실질적 이유는 **인터랙티브 UX**입니다.
+> 드래그앤드롭 업로드, 실시간 진행률, 마크다운 미리보기, 결과 편집 등은 9장의 SaaS 아이디어에 모두 필요한 요소입니다.
+
+### 11-9. React 전용 보안 주의사항
+
+**1. Python 서버를 브라우저에 직접 노출하지 말 것**
+
+```yaml
+converter:
+  expose: ["8000"]     # ports 아님
+```
+
+**2. CORS 와일드카드 금지**
+
+```python
+allow_origins=["https://실제도메인.com"]   # ["*"] 금지
+```
+
+**3. 용량 제한은 프론트와 백엔드 양쪽에** (프론트만 두면 우회 가능)
+
+**4. 변환 결과를 `dangerouslySetInnerHTML`로 렌더링하지 말 것**
+
+변환된 마크다운에 악성 스크립트가 포함될 수 있습니다.
+
+```jsx
+import ReactMarkdown from "react-markdown";
+
+<ReactMarkdown>{markdown}</ReactMarkdown>   // 안전
+```
+
+**5. 오래 걸리는 변환은 폴링 또는 SSE로 처리**
+
+업로드 → jobId 수신 → 상태 폴링 → 완료 시 결과 표시
+
+---
+
+## 12. 보안 체크리스트
+
+> 이 장은 서버 사이드 공통 사항입니다. React 전용 항목은 11-9를 참고하세요.
+
+### 12-1. 셸 인젝션 (최우선)
 
 ```php
 // 위험 - 절대 금지
@@ -878,14 +1163,14 @@ exec("markitdown " . escapeshellarg($path));
 proc_open(['markitdown', $path], $desc, $pipes);
 ```
 
-### 11-2. 업로드 파일명 신뢰 금지
+### 12-2. 업로드 파일명 신뢰 금지
 
 ```php
 $safeName = bin2hex(random_bytes(16)) . '.' . $file->extension();
 $path = storage_path('app/uploads/' . $safeName);
 ```
 
-### 11-3. URI 입력 차단
+### 12-3. URI 입력 차단
 
 MCP 서버의 `convert_to_markdown`은 `file:`, `http:` URI를 모두 받습니다.
 
@@ -894,7 +1179,7 @@ MCP 서버의 `convert_to_markdown`은 `file:`, `http:` URI를 모두 받습니�
 
 **URI는 반드시 서버가 생성해야 하며, 사용자에게는 파일 업로드만 허용해야 합니다.**
 
-### 11-4. PHP 설정
+### 12-4. PHP 설정
 
 ```ini
 upload_max_filesize = 50M
@@ -903,7 +1188,7 @@ max_execution_time = 300
 memory_limit = 256M
 ```
 
-### 11-5. 큐 사용
+### 12-5. 큐 사용
 
 대용량 파일 변환은 오래 걸리므로 동기 처리하면 안 됩니다.
 
@@ -912,7 +1197,7 @@ ConvertDocumentJob::dispatch($upload->id);
 return response()->json(['status' => 'processing']);
 ```
 
-### 11-6. 컨테이너 격리
+### 12-6. 컨테이너 격리
 
 저장소의 `Dockerfile`은 이미 권한 최소화가 되어 있습니다:
 
